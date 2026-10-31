@@ -1,0 +1,24 @@
+# Build output & compiled native binaries
+/dist/
+
+# Gleam compiler output & fetched dependencies
+/build/
+
+# Vendored QuickJS clone & compilation artifacts
+/.vendor/
+
+# Node / esbuild temporary files & packages
+node_modules/
+package-lock.json
+
+# Mise local configuration overrides (if used)
+.mise.local.toml
+
+# Editor & OS metadata
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
