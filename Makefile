@@ -44,13 +44,15 @@ $(TARGET_BIN): $(BUNDLE_OUT) $(if $(SYSTEM_QJSC),,$(VENDOR_DIR)/qjsc)
 ifdef SYSTEM_QJSC
 	@echo "==> Building binary with system qjsc..."
 	qjsc -m -o $(TARGET_BIN) $(BUNDLE_OUT)
+	strip $(TARGET_BIN)
 else
 	@echo "==> Generating C wrapper with vendored qjsc..."
 	$(VENDOR_DIR)/qjsc -m -e -o $(BUILD_DIR)/wrapper.c $(BUNDLE_OUT)
 	@echo "==> Linking native binary via gcc..."
-	$(CC) -O2 -I$(VENDOR_DIR) $(BUILD_DIR)/wrapper.c $(VENDOR_DIR)/libquickjs.a -lm -lpthread -ldl -o $(TARGET_BIN)
+	$(CC) -Os -s -I$(VENDOR_DIR) $(BUILD_DIR)/wrapper.c $(VENDOR_DIR)/libquickjs.a -lm -lpthread -ldl -o $(TARGET_BIN)
 endif
 	@echo "==> Native binary ready: $(TARGET_BIN)"
+	@ls -lh $(TARGET_BIN)
 
 run: $(TARGET_BIN)
 	@./$(TARGET_BIN)

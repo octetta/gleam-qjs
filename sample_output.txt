@@ -1,1 +1,0 @@
-Written from Gleam running on QuickJS native event loop.
