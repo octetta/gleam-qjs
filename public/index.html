@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Gleam + QuickJS WebSocket Console</title>
+  <style>
+    body {
+      font-family: monospace;
+      background: #111;
+      color: #eee;
+      margin: 0;
+      padding: 24px;
+    }
+    h2 { margin-top: 0; color: #6ee7b7; }
+    #status {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-weight: bold;
+      margin-bottom: 16px;
+    }
+    .connected { background: #064e3b; color: #a7f3d0; }
+    .disconnected { background: #7f1d1d; color: #fecaca; }
+    .connecting { background: #78350f; color: #fde68a; }
+    #log {
+      height: 320px;
+      background: #18181b;
+      border: 1px solid #27272a;
+      border-radius: 6px;
+      padding: 12px;
+      overflow-y: auto;
+      list-style: none;
+      margin: 0 0 16px 0;
+    }
+    #log li { margin-bottom: 4px; line-height: 1.4; }
+    #log .in  { color: #60a5fa; }
+    #log .out { color: #f472b6; }
+    #log .sys { color: #a1a1aa; }
+    .controls { display: flex; gap: 8px; }
+    input[type="text"] {
+      flex: 1;
+      background: #27272a;
+      border: 1px solid #3f3f46;
+      color: #fff;
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-family: inherit;
+    }
+    input[type="text"]:focus { outline: 1px solid #6ee7b7; }
+    button {
+      background: #059669;
+      color: #fff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      font-family: inherit;
+    }
+    button:hover { background: #10b981; }
+    button:disabled { background: #3f3f46; color: #71717a; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <h2>Gleam + QuickJS WebSocket Console</h2>
+  <div>Status: <span id="status" class="connecting">Connecting...</span></div>
+
+  <ul id="log"></ul>
+
+  <form id="form" class="controls">
+    <input id="input" type="text" placeholder="Type a message or command (e.g. ping)..." autocomplete="off" disabled />
+    <button id="sendBtn" type="submit" disabled>Send</button>
+  </form>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const logEl    = document.getElementById('log');
+    const formEl   = document.getElementById('form');
+    const inputEl  = document.getElementById('input');
+    const sendBtn  = document.getElementById('sendBtn');
+
+    function appendLog(text, type = 'sys') {
+      const li = document.createElement('li');
+      li.className = type;
+      const ts = new Date().toLocaleTimeString();
+      li.textContent = `[${ts}] ${text}`;
+      logEl.appendChild(li);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    const wsUrl = `ws://${location.host}/ws`;
+    appendLog(`Opening connection to ${wsUrl}...`, 'sys');
+
+    const ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      statusEl.textContent = 'Connected';
+      statusEl.className = 'connected';
+      inputEl.disabled = false;
+      sendBtn.disabled = false;
+      inputEl.focus();
+      appendLog('WebSocket connection established.', 'sys');
+
+      // Send initial handshake ping
+      const greeting = 'ping from browser';
+      ws.send(greeting);
+      appendLog(`Sent: ${greeting}`, 'out');
+    };
+
+    ws.onmessage = (event) => {
+      appendLog(`Received: ${event.data}`, 'in');
+    };
+
+    ws.onerror = (err) => {
+      appendLog('WebSocket error encountered', 'sys');
+    };
+
+    ws.onclose = () => {
+      statusEl.textContent = 'Disconnected';
+      statusEl.className = 'disconnected';
+      inputEl.disabled = true;
+      sendBtn.disabled = true;
+      appendLog('WebSocket connection closed.', 'sys');
+    };
+
+    formEl.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const val = inputEl.value.trim();
+      if (!val) return;
+      ws.send(val);
+      appendLog(`Sent: ${val}`, 'out');
+      inputEl.value = '';
+    });
+  </script>
+</body>
+</html>

@@ -1,4 +1,6 @@
 import gleam/io
+import gleam/int
+import server
 
 pub type Promise(a)
 
@@ -18,22 +20,51 @@ pub fn write_file(path: String, content: String) -> Bool
 pub fn read_file(path: String) -> String
 
 pub fn main() -> Promise(Nil) {
-  io.println("==> [1/4] Starting async demonstration...")
+  io.println("==================================================")
+  io.println("   Gleam + QuickJS Native Native Showcase App     ")
+  io.println("==================================================")
 
-  // Await a timer (500ms delay)
-  use Nil <- await(sleep(500))
-  io.println("==> [2/4] Woke up after 500ms!")
-
-  let filepath = "sample_output.txt"
-  let sample_data = "Written from Gleam running on QuickJS native event loop."
-  io.println("==> [3/4] Writing to file: " <> filepath)
-  let _ = write_file(filepath, sample_data)
-
-  // Pause again before reading
+  // 1. Showcase Async Promises & Timers
+  io.println("--> [1/3] Testing async timer...")
   use Nil <- await(sleep(300))
-  let content = read_file(filepath)
-  io.println("==> [4/4] Read back contents:")
-  io.println("    \"" <> content <> "\"")
+  io.println("          Timer fired after 300ms!")
 
+  // 2. Showcase File I/O via QuickJS std
+  let filepath = "showcase_data.txt"
+  io.println("--> [2/3] Testing file write & read (" <> filepath <> ")...")
+  let _ = write_file(filepath, "Persisted state from Gleam on QuickJS event loop.")
+  let content = read_file(filepath)
+  io.println("          Read back: \"" <> content <> "\"")
+
+  // 3. Showcase HTTP & WebSocket Server (CivetWeb)
+  io.println("--> [3/3] Starting HTTP & WebSocket Server...")
+  let handlers = server.ServerHandlers(
+    on_open: fn(conn) {
+      io.println("          [WS] Client connected: #" <> int.to_string(conn))
+      let _ = server.send(conn, "Connected to Gleam QuickJS backend!")
+      Nil
+    },
+    on_message: fn(conn, msg) {
+      io.println("          [WS] Received: " <> msg)
+      let _ = server.send(conn, "echo: " <> msg)
+      Nil
+    },
+    on_close: fn(conn) {
+      io.println("          [WS] Client disconnected: #" <> int.to_string(conn))
+    },
+  )
+
+  let ok = server.start(8080, "./public", "/ws", handlers)
+  case ok {
+    True -> {
+      io.println("          Server listening on http://localhost:8080")
+      io.println("          WebSocket endpoint at ws://localhost:8080/ws")
+      io.println("          Serving static files from ./public")
+    }
+    False -> io.println("          Failed to bind server port 8080.")
+  }
+
+  // Keep event loop active
+  use Nil <- await(sleep(86400000))
   resolve(Nil)
 }

@@ -4,7 +4,6 @@ import * as os from 'os';
 // 1. setTimeout wrapped in a native Promise
 export function sleep(ms) {
   return new Promise((resolve) => {
-    // quickjs-libc puts setTimeout on globalThis or in module 'os'
     if (typeof setTimeout !== 'undefined') {
       setTimeout(resolve, ms);
     } else {
@@ -22,7 +21,7 @@ export function resolve_promise(value) {
   return Promise.resolve(value);
 }
 
-// 3. Simple synchronous File I/O via QuickJS std
+// 3. Simple File I/O via QuickJS std
 export function write_file(path, content) {
   try {
     const f = std.open(path, "w");
