@@ -1,6 +1,6 @@
 # gleam-qjs
 
-A minimal, zero-bloat pipeline for compiling **Gleam** applications into standalone native binaries (~850 KB) using **Fabrice Bellard's QuickJS** and **CivetWeb**, bypassing both the Erlang/BEAM runtime and Node.js/V8.
+A small pipeline for packaging **Gleam** applications as native executables that embed **Fabrice Bellard's QuickJS** and **CivetWeb**. It avoids shipping the Erlang/BEAM runtime or Node.js/V8, but the Gleam application still runs as JavaScript inside QuickJS.
 
 ---
 
@@ -13,20 +13,23 @@ Gleam is an expressive, type-safe language offering algebraic data types, immuta
 
 ### The QuickJS Alternative
 
-QuickJS compiles modern JavaScript (ES2020) down to bytecode and links directly into a standard C application via a minimal, embeddable interpreter. Because Gleam's JavaScript compiler outputs clean, idiomatic ES modules without proprietary runtime shims, Gleam compiles onto QuickJS seamlessly.
+QuickJS is a small embeddable JavaScript engine. The Gleam JavaScript backend generates JavaScript modules; esbuild bundles those modules, and `qjsc` converts the bundle into bytecode embedded in a C executable. The resulting program runs the Gleam application inside QuickJS.
 
-This architecture offers distinct advantages:
+This architecture can offer:
 
-* **Instantaneous Startup (< 5 ms):** Zero JIT warm-up penalty; bytecode executes immediately via direct threaded interpretation.
-* **Deterministic, Sub-Megabyte Footprint:** A fully functional HTTP file server, WebSocket router, timer engine, and Gleam application compiles into an ~850 KB ELF/Mach-O binary with an idle RSS under 4 MB.
-* **Pure MIT Licensing:** Avoids copyleft infections (such as GPLv3 or AGPL), allowing clean commercial and open-source distribution.
-* **Direct C Boundary:** Native modules link directly at compile time into C bytecode tables. No Node-API/FFI glue layers or dynamic library discovery overhead.
+* **A compact runtime:** QuickJS is substantially smaller than a Node.js/V8 deployment, although executable size and memory use depend on the target, compiler, linker, and enabled features.
+* **No BEAM or Node.js dependency:** The executable embeds QuickJS and links the native C components directly.
+* **A direct C integration point:** Native functionality can be exposed to the embedded JavaScript runtime through QuickJS's C API.
+
+Binary size, startup time, and RSS are build- and platform-dependent. Treat numbers reported for a particular build as measurements, not guarantees; include the target platform, compiler flags, and measurement method when publishing them.
+
+Licensing is component-specific. Check the licenses of Gleam and its dependencies, QuickJS, CivetWeb, and any other bundled components before redistributing a build.
 
 ---
 
 ## 2. Architecture & Execution Model
 
-The system translates functional, typed Gleam code into static C structures, combining a cooperative JS microtask queue with a multi-threaded C I/O substrate.
+The system compiles Gleam to JavaScript, bundles the generated modules, converts the bundle to QuickJS bytecode, and embeds that bytecode in a C executable. The C server handles network I/O while QuickJS runs the Gleam application.
 
 ### Compilation Pipeline
 
@@ -56,35 +59,40 @@ The system translates functional, typed Gleam code into static C structures, com
 
 ### Event Loop & Thread Separation
 
-QuickJS uses non-atomic reference counting on `JSValue` structures and is strictly **single-threaded per context**. To maintain rock-solid stability while serving HTTP assets and concurrent WebSockets:
+QuickJS contexts must only be accessed from their owning thread. In particular,
+CivetWeb worker callbacks must not call `JS_Call`, create or free `JSValue`s, or
+otherwise touch a `JSContext`. WebSocket events are transferred from CivetWeb
+workers to the QuickJS thread through a bounded native event queue:
 
 ```text
- ┌────────────────────────────────────────────────────────────────────────┐
- │ QuickJS Main Thread (Deterministic Event Loop)                         │
- │                                                                        │
- │  Gleam Application State                                               │
- │    │                                                                   │
- │    ▼                                                                   │
- │  Microtask Queue (JS_ExecutePendingJob - Promise resolution)           │
- │    │                                                                   │
- │    ▼                                                                   │
- │  Macrotask Loop  (js_std_loop - timers, os.setTimeout)                 │
- └───────────────────────────────────┬────────────────────────────────────┘
-                                     │
-                         thread-safe callbacks / C ABI
-                                     │
- ┌───────────────────────────────────▼────────────────────────────────────┐
- │ CivetWeb Worker Pool (POSIX Threads)                                   │
- │                                                                        │
- │   Thread 1: Static HTTP asset file streaming (./public/*)              │
- │   Thread 2: RFC 6455 socket polling & frame decoders                   │
- └────────────────────────────────────────────────────────────────────────┘
+  CivetWeb worker threads                 QuickJS owner thread
+  -----------------------                 -------------------
+  WebSocket open/message/close             timer-driven poll
+           |                                       |
+           v                                       v
+  copy event and payload                   dequeue events
+           |                                       |
+           v                                       v
+  bounded, mutex-protected queue  ------> invoke Gleam handlers
+                                                   |
+                                                   v
+                                            QuickJS JSContext
 ```
 
-1. **Microtasks (Promises):** Gleam `use` expressions desugar into `.then()` Promise continuations managed directly by QuickJS's native job queue.
-2. **Macrotasks (Timers & I/O):** Driven by `js_std_loop(ctx)`. The runtime keeps execution alive until all timers and active callbacks resolve.
-3. **C Background Reactor:** CivetWeb runs on separate native POSIX threads (`num_threads: 2`), handling static HTTP range requests and raw socket frames without stalling the Gleam evaluation thread.
+1. **QuickJS ownership:** JavaScript callbacks and `JSValue` operations run on the
+   QuickJS thread, not in CivetWeb worker callbacks.
+2. **WebSocket event delivery:** The current queue holds up to 256 events. Each
+   poll processes at most 64 events before returning to the QuickJS timer loop.
+   If the queue is full, an event is dropped rather than blocking a CivetWeb
+   worker. The current API does not report queue overflow to Gleam.
+3. **Polling:** `server_bridge.mjs` schedules queue polling with
+   `os.setTimeout` (10 ms between polls). Promise continuations are handled by
+   QuickJS's job queue.
+4. **CivetWeb:** CivetWeb performs HTTP and WebSocket network I/O on its worker
+   threads. WebSocket events reach Gleam through the native queue.
 
+This is a small event-queue bridge, not a general-purpose cross-thread QuickJS
+runtime. Keep all QuickJS API use on its owning thread.
 ---
 
 ## 3. API Reference & Interface Contracts
@@ -160,9 +168,19 @@ pub fn send(conn: ConnectionId, message: String) -> Bool
 
 | Handler | Parameter | Behavior |
 | :--- | :--- | :--- |
-| `on_open` | `ConnectionId` (pointer handle) | Triggered when RFC 6455 handshake completes. |
-| `on_message` | `ConnectionId`, `String` | Receives incoming UTF-8 text frames. |
-| `on_close` | `ConnectionId` | Triggered when client disconnects or aborts socket. |
+| `on_open` | `ConnectionId` | Triggered when the WebSocket connection is ready. |
+| `on_message` | `ConnectionId`, `String` | Receives incoming WebSocket text messages. |
+| `on_close` | `ConnectionId` | Triggered when the client disconnects. |
+
+`ConnectionId` is an integer handle allocated by the native server; it is not a
+pointer. The native connection registry removes the handle when the connection
+closes. `send` returns `False` if the handle is no longer active or the write
+fails. The current interface supports text messages; it does not expose binary
+WebSocket frames or a server stop/restart API.
+
+The event queue and connection registry each have a fixed capacity of 256
+entries. The current implementation does not provide application-visible
+backpressure, queue-overflow reporting, or graceful server shutdown.
 
 ---
 
@@ -190,7 +208,7 @@ pub fn send(conn: ConnectionId, message: String) -> Bool
 
 ## 5. Prerequisites & Tooling
 
-Manage toolchains using [mise](https://mise.jdx.dev/):
+Manage the Gleam and Node.js toolchains using [mise](https://mise.jdx.dev/):
 
 ```toml
 # mise.toml
@@ -203,6 +221,7 @@ System requirements:
 * `make`
 * `gcc` or `clang`
 * `git` (to fetch vendored dependencies on first build)
+* `npm`/`npx` for the default esbuild invocation, unless `ESBUILD` is overridden
 
 ---
 
@@ -226,6 +245,16 @@ On first invocation, the build harness automatically:
 5. Emits C bytecode tables via `qjsc -m -e`.
 6. Links everything into `dist/app` using `gcc -Os -s`.
 
+The Makefile uses Bellard's QuickJS repository for `qjsc` and `libquickjs.a`.
+The separate QuickJS-NG entry in `mise.toml` is not the compiler/library used by
+that Makefile build. The Makefile's vendored QuickJS path is `.vendor/quickjs`;
+`mise.toml` currently adds `./vendor/quickjs` to `PATH`, which is a different
+directory.
+
+The default build defines `NO_SSL`, so the CivetWeb build does not provide
+HTTPS or WSS. Use a suitable TLS-enabled build and configure certificates
+before exposing the server beyond a trusted local network.
+
 ### 3. Verify Binary
 ```bash
 $ ls -lh dist/app
@@ -245,8 +274,17 @@ When running `dist/app`, the server starts an HTTP server on port `8080` serving
 2. The browser automatically connects to `ws://localhost:8080/ws`.
 3. View the live connection confirmation and exchange echo messages directly from the in-browser console.
 
+For a quick local test, run `make run` and open the page in a browser on the
+same machine. Do not assume the server is restricted to loopback: check the
+actual listening address and firewall rules before running it on an untrusted
+network.
+
+The current example is a prototype rather than a hardened internet-facing
+server. Add an explicit shutdown path, queue-overflow reporting, TLS, and
+connection/message limits before using it as a public service.
+
 ---
 
 ## 8. License
 
-MIT License. Free for open-source and commercial use.
+The project license applies to this repository's own code. Bundled and fetched dependencies retain their respective licenses; review those licenses before redistributing a combined executable.

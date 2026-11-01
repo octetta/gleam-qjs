@@ -1,131 +1,246 @@
 #include "quickjs.h"
 #include "civetweb.h"
-#include <string.h>
+
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
 
-static struct mg_context *g_mg_ctx = NULL;
-static JSContext *g_js_ctx = NULL;
+#define WS_EVENT_CAPACITY 256
+#define WS_CONNECTION_CAPACITY 256
+#define WS_POLL_BATCH 64
 
-static JSValue g_on_open_cb    = JS_UNDEFINED;
+enum ws_event_type { WS_EVENT_OPEN, WS_EVENT_MESSAGE, WS_EVENT_CLOSE };
+struct ws_event { enum ws_event_type type; int64_t id; char *data; size_t len; };
+struct ws_connection { struct mg_connection *conn; int64_t id; };
+
+static struct mg_context *g_mg_ctx;
+static JSValue g_on_open_cb = JS_UNDEFINED;
 static JSValue g_on_message_cb = JS_UNDEFINED;
-static JSValue g_on_close_cb   = JS_UNDEFINED;
+static JSValue g_on_close_cb = JS_UNDEFINED;
+static struct ws_event g_events[WS_EVENT_CAPACITY];
+static size_t g_event_head, g_event_count;
+static pthread_mutex_t g_event_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct ws_connection g_connections[WS_CONNECTION_CAPACITY];
+static int64_t g_next_connection_id = 1;
+static pthread_mutex_t g_connection_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// --- CivetWeb WebSocket Callbacks ---
+/* CivetWeb worker threads only copy native event data into this bounded queue.
+ * QuickJS is accessed exclusively by js_server_poll on its owner thread. */
+static bool queue_event(enum ws_event_type type, int64_t id,
+                        const char *data, size_t len) {
+    char *copy = NULL;
+    if (len) {
+        copy = (char *)malloc(len);
+        if (!copy) return false;
+        memcpy(copy, data, len);
+    }
+    pthread_mutex_lock(&g_event_mutex);
+    if (g_event_count == WS_EVENT_CAPACITY) {
+        pthread_mutex_unlock(&g_event_mutex);
+        free(copy);
+        return false;
+    }
+    size_t tail = (g_event_head + g_event_count) % WS_EVENT_CAPACITY;
+    g_events[tail] = (struct ws_event){ type, id, copy, len };
+    ++g_event_count;
+    pthread_mutex_unlock(&g_event_mutex);
+    return true;
+}
+
+static bool pop_event(struct ws_event *event) {
+    pthread_mutex_lock(&g_event_mutex);
+    if (!g_event_count) {
+        pthread_mutex_unlock(&g_event_mutex);
+        return false;
+    }
+    *event = g_events[g_event_head];
+    g_event_head = (g_event_head + 1) % WS_EVENT_CAPACITY;
+    --g_event_count;
+    pthread_mutex_unlock(&g_event_mutex);
+    return true;
+}
+
+static int64_t add_connection(struct mg_connection *conn) {
+    int64_t id = 0;
+    pthread_mutex_lock(&g_connection_mutex);
+    for (size_t i = 0; i < WS_CONNECTION_CAPACITY; ++i) {
+        if (!g_connections[i].conn) {
+            id = g_next_connection_id++;
+            if (g_next_connection_id <= 0) g_next_connection_id = 1;
+            g_connections[i] = (struct ws_connection){ conn, id };
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_connection_mutex);
+    return id;
+}
+
+static int64_t find_connection_id(const struct mg_connection *conn) {
+    int64_t id = 0;
+    pthread_mutex_lock(&g_connection_mutex);
+    for (size_t i = 0; i < WS_CONNECTION_CAPACITY; ++i)
+        if (g_connections[i].conn == conn) { id = g_connections[i].id; break; }
+    pthread_mutex_unlock(&g_connection_mutex);
+    return id;
+}
+
+static void remove_connection(const struct mg_connection *conn) {
+    pthread_mutex_lock(&g_connection_mutex);
+    for (size_t i = 0; i < WS_CONNECTION_CAPACITY; ++i) {
+        if (g_connections[i].conn == conn) {
+            g_connections[i] = (struct ws_connection){ 0 };
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_connection_mutex);
+}
 
 static int ws_connect_handler(const struct mg_connection *conn, void *cbdata) {
     (void)conn; (void)cbdata;
-    return 0; // Accept connection
+    return 0;
 }
 
 static void ws_ready_handler(struct mg_connection *conn, void *cbdata) {
     (void)cbdata;
-    if (g_js_ctx && JS_IsFunction(g_js_ctx, g_on_open_cb)) {
-        JSValue arg = JS_NewInt64(g_js_ctx, (intptr_t)conn);
-        JSValue ret = JS_Call(g_js_ctx, g_on_open_cb, JS_UNDEFINED, 1, &arg);
-        JS_FreeValue(g_js_ctx, ret);
-        JS_FreeValue(g_js_ctx, arg);
-    }
+    int64_t id = add_connection(conn);
+    if (!id || !queue_event(WS_EVENT_OPEN, id, NULL, 0))
+        if (id) remove_connection(conn);
 }
 
-static int ws_data_handler(struct mg_connection *conn, int bits, char *data, size_t len, void *cbdata) {
+static int ws_data_handler(struct mg_connection *conn, int bits,
+                           char *data, size_t len, void *cbdata) {
     (void)bits; (void)cbdata;
-    if (g_js_ctx && JS_IsFunction(g_js_ctx, g_on_message_cb)) {
-        JSValue args[2];
-        args[0] = JS_NewInt64(g_js_ctx, (intptr_t)conn);
-        args[1] = JS_NewStringLen(g_js_ctx, data, len);
-        JSValue ret = JS_Call(g_js_ctx, g_on_message_cb, JS_UNDEFINED, 2, args);
-        JS_FreeValue(g_js_ctx, ret);
-        JS_FreeValue(g_js_ctx, args[0]);
-        JS_FreeValue(g_js_ctx, args[1]);
-    }
-    return 1; // Keep connection open
+    int64_t id = find_connection_id(conn);
+    if (id) (void)queue_event(WS_EVENT_MESSAGE, id, data, len);
+    return 1;
 }
 
 static void ws_close_handler(const struct mg_connection *conn, void *cbdata) {
     (void)cbdata;
-    if (g_js_ctx && JS_IsFunction(g_js_ctx, g_on_close_cb)) {
-        JSValue arg = JS_NewInt64(g_js_ctx, (intptr_t)conn);
-        JSValue ret = JS_Call(g_js_ctx, g_on_close_cb, JS_UNDEFINED, 1, &arg);
-        JS_FreeValue(g_js_ctx, ret);
-        JS_FreeValue(g_js_ctx, arg);
-    }
+    int64_t id = find_connection_id(conn);
+    remove_connection(conn);
+    if (id) (void)queue_event(WS_EVENT_CLOSE, id, NULL, 0);
 }
 
-// --- Native C Functions exposed to JS ---
+static void report_js_exception(JSContext *ctx, const char *where) {
+    JSValue exception = JS_GetException(ctx);
+    const char *message = JS_ToCString(ctx, exception);
+    fprintf(stderr, "QuickJS %s callback failed: %s\n", where,
+            message ? message : "(unprintable exception)");
+    if (message) JS_FreeCString(ctx, message);
+    JS_FreeValue(ctx, exception);
+}
 
-static JSValue js_server_start(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    if (argc < 4) return JS_FALSE;
-
-    int port = 8080;
-    JS_ToInt32(ctx, &port, argv[0]);
-    const char *doc_root = JS_ToCString(ctx, argv[1]);
-    const char *ws_path  = JS_ToCString(ctx, argv[2]);
-
-    if (JS_IsObject(argv[3])) {
-        g_js_ctx = ctx;
-        g_on_open_cb    = JS_DupValue(ctx, JS_GetPropertyStr(ctx, argv[3], "onOpen"));
-        g_on_message_cb = JS_DupValue(ctx, JS_GetPropertyStr(ctx, argv[3], "onMessage"));
-        g_on_close_cb   = JS_DupValue(ctx, JS_GetPropertyStr(ctx, argv[3], "onClose"));
+static void call_handler(JSContext *ctx, JSValueConst callback,
+                         const char *name, const struct ws_event *event) {
+    if (!JS_IsFunction(ctx, callback)) return;
+    JSValue args[2];
+    int argc = 1;
+    args[0] = JS_NewInt64(ctx, event->id);
+    if (event->type == WS_EVENT_MESSAGE) {
+        args[1] = JS_NewStringLen(ctx, event->data, event->len);
+        argc = 2;
     }
+    JSValue result = JS_Call(ctx, callback, JS_UNDEFINED, argc, args);
+    if (JS_IsException(result)) report_js_exception(ctx, name);
+    JS_FreeValue(ctx, result);
+    JS_FreeValue(ctx, args[0]);
+    if (argc == 2) JS_FreeValue(ctx, args[1]);
+}
 
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", port);
+static JSValue js_server_poll(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    struct ws_event event;
+    int processed = 0;
+    while (processed < WS_POLL_BATCH && pop_event(&event)) {
+        switch (event.type) {
+        case WS_EVENT_OPEN: call_handler(ctx, g_on_open_cb, "on_open", &event); break;
+        case WS_EVENT_MESSAGE: call_handler(ctx, g_on_message_cb, "on_message", &event); break;
+        case WS_EVENT_CLOSE: call_handler(ctx, g_on_close_cb, "on_close", &event); break;
+        }
+        free(event.data);
+        ++processed;
+    }
+    return JS_NewInt32(ctx, processed);
+}
 
-    const char *options[] = {
-        "listening_ports", port_str,
-        "document_root",   doc_root ? doc_root : "./public",
-        "num_threads",     "2",
-        NULL
-    };
-
-    mg_init_library(0);
-    g_mg_ctx = mg_start(NULL, 0, options);
-
-    if (!g_mg_ctx) {
+static JSValue js_server_start(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 4 || g_mg_ctx) return JS_FALSE;
+    int port = 8080;
+    if (JS_ToInt32(ctx, &port, argv[0]) < 0 || port < 1 || port > 65535) return JS_FALSE;
+    const char *doc_root = JS_ToCString(ctx, argv[1]);
+    const char *ws_path = JS_ToCString(ctx, argv[2]);
+    if (!doc_root || !ws_path || !JS_IsObject(argv[3])) {
         if (doc_root) JS_FreeCString(ctx, doc_root);
         if (ws_path) JS_FreeCString(ctx, ws_path);
         return JS_FALSE;
     }
 
-    mg_set_websocket_handler(g_mg_ctx,
-                             ws_path ? ws_path : "/ws",
-                             ws_connect_handler,
-                             ws_ready_handler,
-                             ws_data_handler,
-                             ws_close_handler,
-                             NULL);
+    /* Gleam record fields are snake_case. GetPropertyStr returns owned values. */
+    JSValue on_open = JS_GetPropertyStr(ctx, argv[3], "on_open");
+    JSValue on_message = JS_GetPropertyStr(ctx, argv[3], "on_message");
+    JSValue on_close = JS_GetPropertyStr(ctx, argv[3], "on_close");
+    JS_FreeValue(ctx, g_on_open_cb);
+    JS_FreeValue(ctx, g_on_message_cb);
+    JS_FreeValue(ctx, g_on_close_cb);
+    g_on_open_cb = on_open;
+    g_on_message_cb = on_message;
+    g_on_close_cb = on_close;
 
-    if (doc_root) JS_FreeCString(ctx, doc_root);
-    if (ws_path) JS_FreeCString(ctx, ws_path);
-    return JS_TRUE;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    const char *options[] = { "listening_ports", port_str,
+                              "document_root", doc_root,
+                              "num_threads", "2", NULL };
+    mg_init_library(0);
+    g_mg_ctx = mg_start(NULL, 0, options);
+    if (g_mg_ctx) {
+        mg_set_websocket_handler(g_mg_ctx, ws_path, ws_connect_handler,
+                                 ws_ready_handler, ws_data_handler,
+                                 ws_close_handler, NULL);
+    } else {
+        mg_exit_library();
+    }
+    JS_FreeCString(ctx, doc_root);
+    JS_FreeCString(ctx, ws_path);
+    return g_mg_ctx ? JS_TRUE : JS_FALSE;
 }
 
-static JSValue js_server_send(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_server_send(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    (void)this_val;
     if (argc < 2) return JS_FALSE;
-
-    int64_t conn_ptr = 0;
-    JS_ToInt64(ctx, &conn_ptr, argv[0]);
-    struct mg_connection *conn = (struct mg_connection *)(intptr_t)conn_ptr;
-    if (!conn) return JS_FALSE;
-
-    const char *msg = JS_ToCString(ctx, argv[1]);
-    if (!msg) return JS_FALSE;
-
-    mg_websocket_write(conn, 1 /* WEBSOCKET_OPCODE_TEXT */, msg, strlen(msg));
-
-    JS_FreeCString(ctx, msg);
-    return JS_TRUE;
+    int64_t id = 0;
+    if (JS_ToInt64(ctx, &id, argv[0]) < 0 || id <= 0) return JS_FALSE;
+    size_t len = 0;
+    const char *message = JS_ToCStringLen(ctx, &len, argv[1]);
+    if (!message) return JS_FALSE;
+    int written = -1;
+    /* Hold the registry lock through the write so close cannot invalidate conn. */
+    pthread_mutex_lock(&g_connection_mutex);
+    for (size_t i = 0; i < WS_CONNECTION_CAPACITY; ++i) {
+        if (g_connections[i].id == id && g_connections[i].conn) {
+            written = mg_websocket_write(g_connections[i].conn, 1, message, len);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_connection_mutex);
+    JS_FreeCString(ctx, message);
+    return written >= 0 ? JS_TRUE : JS_FALSE;
 }
 
-// Attach directly to globalThis.__native_server
 void js_init_server_global(JSContext *ctx) {
     JSValue global_obj = JS_GetGlobalObject(ctx);
     JSValue server_obj = JS_NewObject(ctx);
-
     JS_SetPropertyStr(ctx, server_obj, "start", JS_NewCFunction(ctx, js_server_start, "start", 4));
     JS_SetPropertyStr(ctx, server_obj, "send", JS_NewCFunction(ctx, js_server_send, "send", 2));
-
+    JS_SetPropertyStr(ctx, server_obj, "poll", JS_NewCFunction(ctx, js_server_poll, "poll", 0));
     JS_SetPropertyStr(ctx, global_obj, "__native_server", server_obj);
     JS_FreeValue(ctx, global_obj);
 }
