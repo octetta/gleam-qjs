@@ -8,8 +8,10 @@
 #include <string.h>
 #include <pthread.h>
 
-#define WS_EVENT_CAPACITY 256
+#define WS_EVENT_CAPACITY 512
 #define WS_CONNECTION_CAPACITY 256
+#define WS_MESSAGE_EVENT_LIMIT 256
+#define WS_MAX_MESSAGE_SIZE (64u * 1024u)
 #define WS_POLL_BATCH 64
 
 enum ws_event_type { WS_EVENT_OPEN, WS_EVENT_MESSAGE, WS_EVENT_CLOSE };
@@ -22,10 +24,17 @@ static JSValue g_on_message_cb = JS_UNDEFINED;
 static JSValue g_on_close_cb = JS_UNDEFINED;
 static struct ws_event g_events[WS_EVENT_CAPACITY];
 static size_t g_event_head, g_event_count;
+static uint64_t g_dropped_events;
 static pthread_mutex_t g_event_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct ws_connection g_connections[WS_CONNECTION_CAPACITY];
 static int64_t g_next_connection_id = 1;
 static pthread_mutex_t g_connection_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void record_dropped_event(void) {
+    pthread_mutex_lock(&g_event_mutex);
+    ++g_dropped_events;
+    pthread_mutex_unlock(&g_event_mutex);
+}
 
 /* CivetWeb worker threads only copy native event data into this bounded queue.
  * QuickJS is accessed exclusively by js_server_poll on its owner thread. */
@@ -38,7 +47,10 @@ static bool queue_event(enum ws_event_type type, int64_t id,
         memcpy(copy, data, len);
     }
     pthread_mutex_lock(&g_event_mutex);
-    if (g_event_count == WS_EVENT_CAPACITY) {
+    /* Reserve half the queue for connection lifecycle events. */
+    if (g_event_count == WS_EVENT_CAPACITY ||
+        (type == WS_EVENT_MESSAGE && g_event_count >= WS_MESSAGE_EVENT_LIMIT)) {
+        ++g_dropped_events;
         pthread_mutex_unlock(&g_event_mutex);
         free(copy);
         return false;
@@ -103,18 +115,43 @@ static int ws_connect_handler(const struct mg_connection *conn, void *cbdata) {
     return 0;
 }
 
+static void reject_websocket(struct mg_connection *conn) {
+    /* RFC 6455 close code 1013: try again later (server is overloaded). */
+    const unsigned char payload[] = { 0x03, 0xf5 };
+    (void)mg_websocket_write(conn, MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE,
+                             (const char *)payload, sizeof(payload));
+}
+
 static void ws_ready_handler(struct mg_connection *conn, void *cbdata) {
     (void)cbdata;
     int64_t id = add_connection(conn);
-    if (!id || !queue_event(WS_EVENT_OPEN, id, NULL, 0))
+    if (!id || !queue_event(WS_EVENT_OPEN, id, NULL, 0)) {
         if (id) remove_connection(conn);
+        else {
+            pthread_mutex_lock(&g_event_mutex);
+            ++g_dropped_events;
+            pthread_mutex_unlock(&g_event_mutex);
+        }
+        reject_websocket(conn);
+    }
 }
 
 static int ws_data_handler(struct mg_connection *conn, int bits,
                            char *data, size_t len, void *cbdata) {
-    (void)bits; (void)cbdata;
+    (void)cbdata;
+    /* This API accepts complete, unfragmented text frames only. */
+    if ((bits & 0x0f) != MG_WEBSOCKET_OPCODE_TEXT || !(bits & 0x80) ||
+        len > WS_MAX_MESSAGE_SIZE) {
+        record_dropped_event();
+        return 0;
+    }
     int64_t id = find_connection_id(conn);
-    if (id) (void)queue_event(WS_EVENT_MESSAGE, id, data, len);
+    if (!id) {
+        record_dropped_event();
+        return 0;
+    }
+    if (!queue_event(WS_EVENT_MESSAGE, id, data, len))
+        return 0; /* Close a client whose message cannot be queued. */
     return 1;
 }
 
@@ -165,6 +202,13 @@ static JSValue js_server_poll(JSContext *ctx, JSValueConst this_val,
         free(event.data);
         ++processed;
     }
+    pthread_mutex_lock(&g_event_mutex);
+    uint64_t dropped = g_dropped_events;
+    g_dropped_events = 0;
+    pthread_mutex_unlock(&g_event_mutex);
+    if (dropped)
+        fprintf(stderr, "WebSocket: dropped/rejected %llu event(s) (queue or frame limit)\n",
+                (unsigned long long)dropped);
     return JS_NewInt32(ctx, processed);
 }
 
@@ -232,7 +276,7 @@ static JSValue js_server_send(JSContext *ctx, JSValueConst this_val,
     }
     pthread_mutex_unlock(&g_connection_mutex);
     JS_FreeCString(ctx, message);
-    return written >= 0 ? JS_TRUE : JS_FALSE;
+    return written > 0 ? JS_TRUE : JS_FALSE;
 }
 
 void js_init_server_global(JSContext *ctx) {

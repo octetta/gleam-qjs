@@ -52,7 +52,7 @@ $(BUNDLE_OUT): $(GLEAM_ENTRY)
 		--outfile=$(BUNDLE_OUT)
 
 # 6. Generate C bytecode and link with QuickJS and CivetWeb
-$(TARGET_BIN): $(VENDOR_DIR)/qjsc $(CIVET_DIR)/src/civetweb.c $(PUBLIC_DIR) $(BUNDLE_OUT) src/server_qjs.c
+$(TARGET_BIN): $(VENDOR_DIR)/qjsc $(VENDOR_DIR)/libquickjs.a $(CIVET_DIR)/src/civetweb.c $(PUBLIC_DIR) $(BUNDLE_OUT) src/server_qjs.c
 	@echo "==> Generating QuickJS C bytecode wrapper..."
 	$(VENDOR_DIR)/qjsc -m -e -o $(BUILD_DIR)/wrapper.c $(BUNDLE_OUT)
 	@echo "==> Patching C wrapper to register server global..."
@@ -77,7 +77,7 @@ run: $(TARGET_BIN)
 
 clean:
 	gleam clean
-	rm -rf $(BUILD_DIR) showcase_data.txt
+	rm -rf $(BUILD_DIR)
 
 distclean: clean
 	rm -rf .vendor
